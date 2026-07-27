@@ -2466,7 +2466,7 @@ fn apply_driver_snapshot(sandbox: &mut Sandbox, incoming: &DriverSandbox, sessio
             (phase, status)
         },
         |incoming_status| {
-            let composed = ComposedPhase::new(incoming_status, session_connected);
+            let composed = ComposedPhase::new(incoming_status, session_connected, old_phase);
             let mut status = Some(public_status_from_driver(
                 incoming_status,
                 composed.phase,
@@ -2543,26 +2543,36 @@ fn ensure_supervisor_ready_status(status: &mut Option<SandboxStatus>, sandbox_na
 struct ComposedPhase {
     phase: SandboxPhase,
     session_connected: bool,
+    store_ready_without_local_session: bool,
     backend_ready_without_session: bool,
 }
 
 impl ComposedPhase {
-    fn new(incoming_status: &DriverSandboxStatus, session_connected: bool) -> Self {
+    fn new(
+        incoming_status: &DriverSandboxStatus,
+        session_connected: bool,
+        old_phase: SandboxPhase,
+    ) -> Self {
         let backend_phase = derive_phase(Some(incoming_status));
         // A live supervisor session is a stronger readiness signal than the backend phase.
         // set_supervisor_session_state may have already promoted the store record to Ready
-        // before this driver snapshot arrived. Keep Ready rather than letting a lagging
-        // backend phase overwrite it.
+        // on another HA replica before this driver snapshot arrived. Keep Ready rather than
+        // letting this replica's process-local session registry demote shared store state.
+        let store_ready_without_local_session = old_phase == SandboxPhase::Ready
+            && !session_connected
+            && !matches!(backend_phase, SandboxPhase::Error | SandboxPhase::Deleting);
         let phase = match backend_phase {
             SandboxPhase::Error | SandboxPhase::Deleting => backend_phase,
-            _ if session_connected => SandboxPhase::Ready,
+            _ if session_connected || store_ready_without_local_session => SandboxPhase::Ready,
             _ => SandboxPhase::Provisioning,
         };
         Self {
             phase,
             session_connected,
+            store_ready_without_local_session,
             backend_ready_without_session: backend_phase == SandboxPhase::Ready
-                && !session_connected,
+                && !session_connected
+                && !store_ready_without_local_session,
         }
     }
 
@@ -2575,7 +2585,9 @@ impl ComposedPhase {
         rewrite_user_facing_conditions(status, spec);
         if self.backend_ready_without_session {
             ensure_supervisor_not_connected_status(status, sandbox_name);
-        } else if self.session_connected && self.phase == SandboxPhase::Ready {
+        } else if (self.session_connected || self.store_ready_without_local_session)
+            && self.phase == SandboxPhase::Ready
+        {
             ensure_supervisor_ready_status(status, sandbox_name);
         }
     }
@@ -5380,6 +5392,42 @@ mod tests {
             cond.message,
             "Backend ready; waiting for supervisor session"
         );
+    }
+
+    #[tokio::test]
+    async fn backend_ready_snapshot_on_non_owner_replica_preserves_store_ready() {
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let session_owner = new_test_runtime(store.clone()).await;
+        let reconciler = new_test_runtime(store.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        store.put_message(&sandbox).await.unwrap();
+
+        session_owner
+            .supervisor_session_connected("sb-1")
+            .await
+            .unwrap();
+        assert!(!reconciler.supervisor_sessions.has_session("sb-1"));
+
+        reconciler
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-1".to_string(),
+                name: "sandbox-a".to_string(),
+                namespace: "default".to_string(),
+                workspace: String::new(),
+                spec: None,
+                status: Some(make_ready_driver_status()),
+            })
+            .await
+            .unwrap();
+
+        let stored = store.get_message::<Sandbox>("sb-1").await.unwrap().unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+        let cond = ready_condition(&stored).unwrap();
+        assert_eq!(cond.status, "True");
+        assert_eq!(cond.reason, "DependenciesReady");
     }
 
     #[tokio::test]

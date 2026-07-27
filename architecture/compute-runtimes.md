@@ -40,19 +40,18 @@ backend_phase = derive_phase(driver_status)
 
 public_phase =
   if backend_phase in {Error, Deleting}:                     → pass through (terminal precedence)
-  if backend_phase == Ready && session connected:             → Ready
-  if backend_phase == Ready && no session:                    → Provisioning
-  if backend_phase in {Provisioning, Unknown} && session:    → Ready
-  if backend_phase in {Provisioning, Unknown} && no session: → Provisioning
+  if session connected:                                       → Ready
+  if previous public phase == Ready:                          → Ready
+  if backend_phase == Ready && no recorded session:           → Provisioning
+  if backend_phase in {Provisioning, Unknown}:                → Provisioning
 ```
 
-When `public_phase == Ready` the sandbox is usable through the gateway — both the
-backend resource is healthy and a supervisor session is registered. A sandbox whose
-backend reports ready but has no supervisor session yet holds `Provisioning` with a
-`Ready=False`, `SupervisorNotConnected` condition and the message
-`Backend ready; waiting for supervisor session`. This distinguishes it from a sandbox
-whose compute resource is still provisioning without exposing contradictory public
-readiness signals.
+When `public_phase == Ready` the sandbox is usable through the gateway. A sandbox
+whose backend reports ready but has no locally connected or previously recorded
+supervisor session yet holds `Provisioning` with a `Ready=False`,
+`SupervisorNotConnected` condition and the message `Backend ready; waiting for
+supervisor session`. This distinguishes it from a sandbox whose compute resource is
+still provisioning without exposing contradictory public readiness signals.
 
 **Session precedence over lagging driver snapshots:** A supervisor session can only be
 established by a running workload. When `set_supervisor_session_state` promotes the
@@ -61,11 +60,13 @@ shortly after carrying a stale `Provisioning` or `Unknown` backend phase. The
 composition rule treats a connected session as the stronger signal and keeps `Ready`
 in that case, preventing a lagging snapshot from undoing the session-driven promotion.
 
-**HA deployments:** Supervisor sessions are process-local. A gateway replica that
-does not own the active supervisor session holds the public phase at `Provisioning`.
-The owning replica's `supervisor_session_connected` write propagates through the
-shared store and reconcile loop. This is correct behavior — a replica should not
-claim `Ready` for a session it does not hold.
+**HA deployments:** Supervisor sessions are process-local, but the shared store is
+the cross-replica readiness boundary. The owning replica's
+`supervisor_session_connected` write promotes the stored sandbox to `Ready`.
+Non-owner replicas preserve that stored `Ready` state when processing non-terminal
+driver snapshots, even though their local session registry does not hold the
+connection. An explicit supervisor disconnect writes `Provisioning`, and terminal
+backend states still take precedence.
 
 **Extension point:** The readiness decision is a safety invariant, not an
 operator-configurable hook. The driver contract is the correct extension point for
